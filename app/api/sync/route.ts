@@ -4,7 +4,7 @@ import { syncNotionToGCal } from "@/lib/sync";
 /**
  * GET /api/sync
  *
- * Notion → Google Calendar の同期を実行するAPIエンドポイント
+ * Notion ⇄ Google Calendar の双方向同期を実行するAPIエンドポイント
  * Vercel Cron または外部cronサービスからトリガーされる
  */
 export async function GET(request: NextRequest) {
@@ -43,7 +43,7 @@ export async function GET(request: NextRequest) {
     const result = await syncNotionToGCal(sinceTimestamp);
 
     console.log(
-      `同期完了: 作成=${result.created}, 更新=${result.updated}, 削除=${result.deleted}, エラー=${result.errors.length}`
+      `同期完了: 作成=${result.created}, 更新=${result.updated}, 削除=${result.deleted}, Notion更新=${result.notionUpdated}, エラー=${result.errors.length}`
     );
 
     return NextResponse.json({

@@ -18,9 +18,61 @@ const calendarId = process.env.GOOGLE_CALENDAR_ID!;
 
 export interface CalendarEvent {
   summary: string;
-  start: string; // ISO 8601
-  end: string; // ISO 8601
+  start: string; // ISO 8601（終日の場合は YYYY-MM-DD）
+  end: string; // ISO 8601（終日の場合は排他的な終了日 YYYY-MM-DD）
   description?: string;
+  notionPageId?: string;
+}
+
+/**
+ * 予定の extendedProperties.private に保存する同期情報。
+ * synced* は「最後に両者が一致していた時点のタイトル・日時」で、
+ * 次回同期時にどちら側が変更されたかを判定するのに使う。
+ */
+export interface SyncSnapshot {
+  notionPageId?: string;
+  syncedSummary?: string;
+  syncedStart?: string;
+  syncedEnd?: string;
+}
+
+function toEventDateTime(
+  value: string,
+  isAllDay: boolean
+): calendar_v3.Schema$EventDateTime {
+  return isAllDay ? { date: value } : { dateTime: value, timeZone: "Asia/Tokyo" };
+}
+
+function buildRequestBody(event: CalendarEvent): calendar_v3.Schema$Event {
+  const isAllDay = !event.start.includes("T");
+  const end = event.end || event.start;
+
+  return {
+    summary: event.summary,
+    description: event.description,
+    start: toEventDateTime(event.start, isAllDay),
+    end: toEventDateTime(end, isAllDay),
+    ...(event.notionPageId
+      ? {
+          extendedProperties: {
+            private: {
+              notionPageId: event.notionPageId,
+              syncedSummary: event.summary,
+              syncedStart: event.start,
+              syncedEnd: end,
+            },
+          },
+        }
+      : {}),
+  };
+}
+
+function isNotFound(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    (error as { code: number }).code === 404
+  );
 }
 
 /**
@@ -30,23 +82,9 @@ export interface CalendarEvent {
 export async function createEvent(event: CalendarEvent): Promise<string> {
   const calendar = getCalendarClient();
 
-  const isAllDay = !event.start.includes("T");
-
   const response = await calendar.events.insert({
     calendarId,
-    requestBody: {
-      summary: event.summary,
-      description: event.description,
-      start: isAllDay
-        ? { date: event.start }
-        : { dateTime: event.start, timeZone: "Asia/Tokyo" },
-      end: isAllDay
-        ? { date: event.end || event.start }
-        : {
-            dateTime: event.end || event.start,
-            timeZone: "Asia/Tokyo",
-          },
-    },
+    requestBody: buildRequestBody(event),
   });
 
   return response.data.id!;
@@ -61,23 +99,27 @@ export async function updateEvent(
 ): Promise<void> {
   const calendar = getCalendarClient();
 
-  const isAllDay = !event.start.includes("T");
-
   await calendar.events.update({
     calendarId,
     eventId,
+    requestBody: buildRequestBody(event),
+  });
+}
+
+/**
+ * 同期スナップショットだけを更新（予定の内容は変えない）
+ */
+export async function setSyncSnapshot(
+  eventId: string,
+  snapshot: Required<SyncSnapshot>
+): Promise<void> {
+  const calendar = getCalendarClient();
+
+  await calendar.events.patch({
+    calendarId,
+    eventId,
     requestBody: {
-      summary: event.summary,
-      description: event.description,
-      start: isAllDay
-        ? { date: event.start }
-        : { dateTime: event.start, timeZone: "Asia/Tokyo" },
-      end: isAllDay
-        ? { date: event.end || event.start }
-        : {
-            dateTime: event.end || event.start,
-            timeZone: "Asia/Tokyo",
-          },
+      extendedProperties: { private: { ...snapshot } },
     },
   });
 }
@@ -95,7 +137,7 @@ export async function deleteEvent(eventId: string): Promise<void> {
     });
   } catch (error: unknown) {
     // 既に削除されている場合は無視
-    if (error instanceof Error && "code" in error && (error as { code: number }).code === 404) {
+    if (isNotFound(error)) {
       console.log(`Event ${eventId} already deleted, skipping.`);
     } else {
       throw error;
@@ -118,9 +160,38 @@ export async function getEvent(
     });
     return response.data;
   } catch (error: unknown) {
-    if (error instanceof Error && "code" in error && (error as { code: number }).code === 404) {
+    if (isNotFound(error)) {
       return null;
     }
     throw error;
   }
+}
+
+/**
+ * 指定時刻以降に更新されたイベントを取得（削除済みイベントは除外）
+ */
+export async function listUpdatedEvents(
+  sinceTimestamp: string
+): Promise<calendar_v3.Schema$Event[]> {
+  const calendar = getCalendarClient();
+  const events: calendar_v3.Schema$Event[] = [];
+  let pageToken: string | undefined;
+
+  do {
+    const response = await calendar.events.list({
+      calendarId,
+      updatedMin: sinceTimestamp,
+      maxResults: 250,
+      pageToken,
+    });
+
+    for (const event of response.data.items ?? []) {
+      // updatedMin 指定時は削除済み(cancelled)も必ず返ってくるので除外
+      if (event.status !== "cancelled") events.push(event);
+    }
+
+    pageToken = response.data.nextPageToken ?? undefined;
+  } while (pageToken);
+
+  return events;
 }
